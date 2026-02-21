@@ -94,7 +94,26 @@ herd-services start --php /usr/local/bin/php8.4
 1. Queries Herd's MCP server to discover all currently running services
 2. Parses your `herd.yml` for the services your project needs (name, version, port)
 3. Resolves port variables (e.g. `${DB_PORT}`) by looking up only the referenced keys in your `.env` file
-4. Stops and/or starts services via AppleScript commands to the Herd application
+4. Looks up each service's internal UUID from Herd's `services.plist` registry
+5. Stops and/or starts services by UUID via AppleScript commands to the Herd application
+
+### Service ID resolution
+
+This script uses your services.plist to find the service ID for running the correct services in the `herd.yml` file
+
+Specifically the one located here:
+
+```
+~/Library/Application Support/Herd/config/services.plist
+```
+
+It matches each service by `type`, `version`, and `port` to find the corresponding UUID — this is necessary because multiple instances of the same service type can exist (e.g. MySQL 8 on port 3306 and MySQL 9 on port 3307). The UUID is then passed to the AppleScript API:
+
+```
+tell application "Herd" to start extraservice "UUID"
+```
+
+If the plist is not present, the script exits early with an error — this file is only created for Herd Pro subscribers. If a specific service from your `herd.yml` has no matching entry in the plist, it is skipped with a warning.
 
 ### Port resolution
 
@@ -111,8 +130,8 @@ services:
 ```
 
 The script will:
-- Look up `DB_PORT` in your `.env` file
-- Use the bash default syntax (`:-9000`) as a fallback if `AWS_ENDPOINT_PORT` is not found
+- Look up any enviornment file key references from your `herd.yml` file to your `.env` file (it only searches keys first and then only the values of matching keys that are referenced)
+- Use the bash default syntax (`:-9000`) as a fallback if the enviornment reference key isn't found
 - Skip starting a service if no port can be resolved, and display a message
 
 ## Requirements

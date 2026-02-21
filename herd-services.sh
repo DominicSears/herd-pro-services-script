@@ -47,6 +47,7 @@ fi
 WORK_DIR="$(pwd)"
 HERD_YML="$WORK_DIR/herd.yml"
 HERD_MCP="/Applications/Herd.app/Contents/Resources/herd-mcp.phar"
+HERD_PLIST="$HOME/Library/Application Support/Herd/config/services.plist"
 
 if [[ ! -f "$HERD_YML" ]]; then
   echo ""
@@ -56,6 +57,18 @@ if [[ ! -f "$HERD_YML" ]]; then
   echo -e "${RED}Error:${RESET} herd.yml not found in ${BOLD}$WORK_DIR${RESET}"
   echo -e "${DIM}Make sure you're running this from a directory with a herd.yml file.${RESET}"
   echo -e "${DIM}This file is created by Laravel Herd when you configure services for a project.${RESET}"
+  echo ""
+  exit 1
+fi
+
+if [[ ! -f "$HERD_PLIST" ]]; then
+  echo ""
+  echo -e "${BOLD}${CYAN}Herd Services Manager${RESET}"
+  echo -e "${DIM}────────────────────────────────────${RESET}"
+  echo ""
+  echo -e "${RED}Error:${RESET} Herd services registry not found."
+  echo -e "${DIM}Expected: ${BOLD}$HERD_PLIST${RESET}"
+  echo -e "${DIM}Service management requires a Herd Pro subscription.${RESET}"
   echo ""
   exit 1
 fi
@@ -114,6 +127,30 @@ build_herd_ports() {
     resolved=$(eval echo "$port_raw")
     [[ -n "$resolved" ]] && echo "$resolved"
   done < <(parse_herd_services)
+}
+
+# Look up a service UUID from the Herd plist by type, version, and port
+get_service_id() {
+  awk -v find_type="$1" -v find_version="$2" -v find_port="$3" '
+    /<dict>/              { id=""; cur_type=""; cur_version=""; cur_port=""; next_key="" }
+    /<key>id<\/key>/      { next_key="id" }
+    /<key>type<\/key>/    { next_key="type" }
+    /<key>version<\/key>/ { next_key="version" }
+    /<key>port<\/key>/    { next_key="port" }
+    next_key != "" && /<string>/ {
+      val=$0; gsub(/[ \t]*<string>/, "", val); gsub(/<\/string>.*/, "", val)
+      if      (next_key == "id")      id=val
+      else if (next_key == "type")    cur_type=val
+      else if (next_key == "version") cur_version=val
+      else if (next_key == "port")    cur_port=val
+      next_key=""
+    }
+    /<\/dict>/ {
+      if (cur_type == find_type && cur_version == find_version && cur_port == find_port && id != "") {
+        print id; exit
+      }
+    }
+  ' "$HERD_PLIST"
 }
 
 # Extract active services from MCP JSON (output: type|port|version per line)
@@ -240,10 +277,16 @@ if [[ "$MODE" == "start" ]]; then
       continue
     fi
 
-    if osascript -e 'tell application "Herd" to stop extraservice "'"$svc_type"'" port "'"$svc_port"'" version "'"$svc_version"'"' >/dev/null 2>&1; then
+    svc_id=$(get_service_id "$svc_type" "$svc_version" "$svc_port")
+    if [[ -z "$svc_id" ]]; then
+      echo -e "  ${svc_label} ${DIM}port:${RESET} $svc_port ${DIM}version:${RESET} $svc_version ${YELLOW}skipped${RESET} ${DIM}(not found in Herd services registry)${RESET}"
+      skip_count=$((skip_count + 1)); continue
+    fi
+    if osascript_err=$(osascript -e 'tell application "Herd" to stop extraservice "'"$svc_id"'"' 2>&1 >/dev/null); then
       echo -e "  ${svc_label} ${DIM}port:${RESET} $svc_port ${DIM}version:${RESET} $svc_version ${RED}stopped${RESET}"
     else
       echo -e "  ${svc_label} ${DIM}port:${RESET} $svc_port ${DIM}version:${RESET} $svc_version ${YELLOW}warning${RESET} ${DIM}(failed to stop)${RESET}"
+      [[ -n "$osascript_err" ]] && echo -e "    ${RED}${DIM}↳ $(echo "$osascript_err" | sed 's/^[0-9]*:[0-9]*: //')${RESET}"
       fail_count=$((fail_count + 1))
     fi
     stop_count=$((stop_count + 1))
@@ -277,10 +320,16 @@ if [[ "$MODE" == "start" ]]; then
       continue
     fi
 
-    if osascript -e 'tell application "Herd" to start extraservice "'"$svc_name"'" port "'"$svc_port"'" version "'"$svc_version"'"' >/dev/null 2>&1; then
+    svc_id=$(get_service_id "$svc_name" "$svc_version" "$svc_port")
+    if [[ -z "$svc_id" ]]; then
+      echo -e "  ${svc_label} ${DIM}port:${RESET} $svc_port ${DIM}version:${RESET} $svc_version ${YELLOW}skipped${RESET} ${DIM}(not found in Herd services registry)${RESET}"
+      skip_count=$((skip_count + 1)); continue
+    fi
+    if osascript_err=$(osascript -e 'tell application "Herd" to start extraservice "'"$svc_id"'"' 2>&1 >/dev/null); then
       echo -e "  ${svc_label} ${DIM}port:${RESET} $svc_port ${DIM}version:${RESET} $svc_version ${GREEN}started${RESET}"
     else
       echo -e "  ${svc_label} ${DIM}port:${RESET} $svc_port ${DIM}version:${RESET} $svc_version ${YELLOW}warning${RESET} ${DIM}(failed to start)${RESET}"
+      [[ -n "$osascript_err" ]] && echo -e "    ${RED}${DIM}↳ $(echo "$osascript_err" | sed 's/^[0-9]*:[0-9]*: //')${RESET}"
       fail_count=$((fail_count + 1))
     fi
     start_count=$((start_count + 1))
@@ -301,10 +350,16 @@ elif [[ "$MODE" == "stop" ]]; then
       [[ -z "$svc_type" ]] && continue
       svc_label=$(printf "%-15s" "$svc_type")
 
-      if osascript -e 'tell application "Herd" to stop extraservice "'"$svc_type"'" port "'"$svc_port"'" version "'"$svc_version"'"' >/dev/null 2>&1; then
+      svc_id=$(get_service_id "$svc_type" "$svc_version" "$svc_port")
+      if [[ -z "$svc_id" ]]; then
+        echo -e "  ${svc_label} ${DIM}port:${RESET} $svc_port ${DIM}version:${RESET} $svc_version ${YELLOW}skipped${RESET} ${DIM}(not found in Herd services registry)${RESET}"
+        skip_count=$((skip_count + 1)); continue
+      fi
+      if osascript_err=$(osascript -e 'tell application "Herd" to stop extraservice "'"$svc_id"'"' 2>&1 >/dev/null); then
         echo -e "  ${svc_label} ${DIM}port:${RESET} $svc_port ${DIM}version:${RESET} $svc_version ${RED}stopped${RESET}"
       else
         echo -e "  ${svc_label} ${DIM}port:${RESET} $svc_port ${DIM}version:${RESET} $svc_version ${YELLOW}warning${RESET} ${DIM}(failed to stop)${RESET}"
+        [[ -n "$osascript_err" ]] && echo -e "    ${RED}${DIM}↳ $(echo "$osascript_err" | sed 's/^[0-9]*:[0-9]*: //')${RESET}"
         fail_count=$((fail_count + 1))
       fi
       stop_count=$((stop_count + 1))
@@ -332,10 +387,16 @@ elif [[ "$MODE" == "stop" ]]; then
         continue
       fi
 
-      if osascript -e 'tell application "Herd" to stop extraservice "'"$svc_name"'" port "'"$svc_port"'" version "'"$svc_version"'"' >/dev/null 2>&1; then
+      svc_id=$(get_service_id "$svc_name" "$svc_version" "$svc_port")
+      if [[ -z "$svc_id" ]]; then
+        echo -e "  ${svc_label} ${DIM}port:${RESET} $svc_port ${DIM}version:${RESET} $svc_version ${YELLOW}skipped${RESET} ${DIM}(not found in Herd services registry)${RESET}"
+        skip_count=$((skip_count + 1)); continue
+      fi
+      if osascript_err=$(osascript -e 'tell application "Herd" to stop extraservice "'"$svc_id"'"' 2>&1 >/dev/null); then
         echo -e "  ${svc_label} ${DIM}port:${RESET} $svc_port ${DIM}version:${RESET} $svc_version ${RED}stopped${RESET}"
       else
         echo -e "  ${svc_label} ${DIM}port:${RESET} $svc_port ${DIM}version:${RESET} $svc_version ${YELLOW}warning${RESET} ${DIM}(failed to stop)${RESET}"
+        [[ -n "$osascript_err" ]] && echo -e "    ${RED}${DIM}↳ $(echo "$osascript_err" | sed 's/^[0-9]*:[0-9]*: //')${RESET}"
         fail_count=$((fail_count + 1))
       fi
       stop_count=$((stop_count + 1))
@@ -357,13 +418,4 @@ if [[ $kept_count -gt 0 ]]; then
   summary+=" | ${CYAN}$kept_count kept running${RESET}"
 fi
 echo -e "$summary"
-
-# Check if all commands failed (likely no Herd Pro)
-total_attempted=$((stop_count + start_count - skip_count))
-if [[ $total_attempted -gt 0 && $fail_count -eq $total_attempted ]]; then
-  echo ""
-  echo -e "${RED}All service commands failed.${RESET}"
-  echo -e "${DIM}This typically means Herd Pro is not active. Services require a Herd Pro subscription.${RESET}"
-  echo -e "${DIM}Herd Pro is required for service management.${RESET}"
-fi
 echo ""
