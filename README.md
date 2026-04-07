@@ -1,6 +1,6 @@
 # Herd Services Manager
 
-A bash script to manage Laravel Herd services from the command line. It reads your project's `herd.yml` to start and stop services, resolving ports from your `.env` file.
+A bash script to manage Laravel Herd services from the command line. It reads your project's `herd.yml` to start and stop services (resolving ports from your `.env` file) and switches the PHP version to whatever your project declares.
 
 > **Note:** This script requires Herd Pro for service management.
 
@@ -44,7 +44,7 @@ herd-services <command> [options]
 
 | Command | Description |
 |---------|-------------|
-| `start` | Stop active services, then start services defined in `herd.yml` |
+| `start` | Switch to the PHP version in `herd.yml`, stop active services, then start the services defined in `herd.yml` |
 | `stop`  | Stop services defined in `herd.yml` |
 
 ### Options
@@ -53,7 +53,7 @@ herd-services <command> [options]
 |------|-----------|------------|-------------|
 | `--conflicts-only` | `-c` | `start` | Only stop active services that have conflicting ports with your `herd.yml` services |
 | `--all` | `-a` | `stop` | Stop all active services, not just the ones in `herd.yml` |
-| `--php <path>` | — | — | Path to PHP binary (default: whichever `php` is in your PATH) |
+| `--isolate` | — | `start` | Set the PHP version per-site using `herd isolate <version>` instead of the global `herd use <version>` |
 | `--help` | `-h` | — | Show usage help |
 
 ### Examples
@@ -83,37 +83,46 @@ Stop every active Herd service:
 herd-services stop -a
 ```
 
-Use a specific PHP binary:
+Isolate the PHP version for the current site (per-site instead of global):
 
 ```bash
-herd-services start --php /usr/local/bin/php8.4
+herd-services start --isolate
 ```
 
 ## How it works
 
-1. Queries Herd's MCP server to discover all currently running services
-2. Parses your `herd.yml` for the services your project needs (name, version, port)
+1. Reads your `herd.yml` for the services your project needs (name, version, port) and the `php:` field for the PHP version
+2. Calls `herd services:list --json` once to get every Herd service with its current `status` (`running`/`stopped`) and internal UUID
 3. Resolves port variables (e.g. `${DB_PORT}`) by looking up only the referenced keys in your `.env` file
-4. Looks up each service's internal UUID from Herd's `services.plist` registry
+4. (`start` only) Switches the PHP version with `herd use <version>` (or `herd isolate <version>` with `--isolate`)
 5. Stops and/or starts services by UUID via AppleScript commands to the Herd application
 
 ### Service ID resolution
 
-This script uses your services.plist to find the service ID for running the correct services in the `herd.yml` file
-
-Specifically the one located here:
-
-```
-~/Library/Application Support/Herd/config/services.plist
-```
-
-It matches each service by `type`, `version`, and `port` to find the corresponding UUID — this is necessary because multiple instances of the same service type can exist (e.g. MySQL 8 on port 3306 and MySQL 9 on port 3307). The UUID is then passed to the AppleScript API:
+The script gets every service's UUID directly from `herd services:list --json`. Each `herd.yml` service is matched against that list by `type`, `version`, and `port` to find the corresponding UUID — this is necessary because multiple instances of the same service type can exist (e.g. MySQL 8 on port 3306 and MySQL 9 on port 3307). The UUID is then passed to the AppleScript API:
 
 ```
 tell application "Herd" to start extraservice "UUID"
 ```
 
-If the plist is not present, the script exits early with an error — this file is only created for Herd Pro subscribers. If a specific service from your `herd.yml` has no matching entry in the plist, it is skipped with a warning.
+If a specific service from your `herd.yml` has no matching entry in Herd's services list, it is skipped with a warning.
+
+### PHP version switching
+
+If your `herd.yml` has a top-level `php:` key, `herd-services start` will run `herd use <version>` to set the global PHP version before starting services. With `--isolate`, it runs `herd isolate <version>` instead, which sets the PHP version for the current site only.
+
+```yaml
+name: my-project
+php: '8.5'
+services:
+    ...
+```
+
+If `php:` is not present in `herd.yml`, the PHP version step is skipped.
+
+### Handling misconfigured `php.ini`
+
+`herd services:list --json` may print PHP warnings (e.g. *"...doesn't appear to be a valid Zend extension"*) before the JSON if your `php.ini` has issues. The script captures both stdout and stderr and grabs the first line that starts with `[`, so it works whether or not those warnings are present.
 
 ### Port resolution
 
@@ -137,9 +146,9 @@ The script will:
 ## Requirements
 
 - macOS
-- Laravel Herd with a Herd Pro subscription
+- Laravel Herd with a Herd Pro subscription (the `herd` CLI must be in your `PATH`)
 
-No additional dependencies — the script uses only `bash`, `awk`, `sed`, `grep`, and `php` (bundled with Herd).
+No additional dependencies — the script uses only `bash`, `awk`, `sed`, and `grep`.
 
 ## Issues & Pull Requests
 If you find any issues, feel free to raise an issue or a PR if you're not an AI bot (only humans)

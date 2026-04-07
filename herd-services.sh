@@ -11,7 +11,7 @@ RESET='\033[0m'
 MODE=""
 CONFLICTS_ONLY=false
 ALL=false
-PHP_BIN="php"
+ISOLATE=false
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -19,18 +19,20 @@ while [[ $# -gt 0 ]]; do
     stop)               MODE="stop" ;;
     --conflicts-only|-c) CONFLICTS_ONLY=true ;;
     --all|-a)           ALL=true ;;
-    --php)              PHP_BIN="$2"; shift ;;
+    --isolate)          ISOLATE=true ;;
     --help|-h)
       echo "Usage: $(basename "$0") <start|stop> [options]"
       echo ""
       echo "Commands:"
-      echo "  start                Stop active services, then start services from herd.yml"
+      echo "  start                Stop active services, then start services from herd.yml."
+      echo "                       Also switches the PHP version using the 'php' field in herd.yml."
       echo "  stop                 Stop services defined in herd.yml"
       echo ""
       echo "Options:"
       echo "  -c, --conflicts-only  (start) Only stop active services with conflicting ports"
       echo "  -a, --all             (stop) Stop all active services, not just herd.yml ones"
-      echo "      --php <path>      Path to PHP binary (default: php)"
+      echo "      --isolate         (start) Use 'herd isolate <version>' instead of 'herd use <version>'"
+      echo "                                to set the PHP version per-site instead of globally"
       echo "  -h, --help            Show this help"
       exit 0
       ;;
@@ -46,8 +48,6 @@ fi
 
 WORK_DIR="$(pwd)"
 HERD_YML="$WORK_DIR/herd.yml"
-HERD_MCP="/Applications/Herd.app/Contents/Resources/herd-mcp.phar"
-HERD_PLIST="$HOME/Library/Application Support/Herd/config/services.plist"
 
 if [[ ! -f "$HERD_YML" ]]; then
   echo ""
@@ -61,14 +61,12 @@ if [[ ! -f "$HERD_YML" ]]; then
   exit 1
 fi
 
-if [[ ! -f "$HERD_PLIST" ]]; then
+if ! command -v herd >/dev/null 2>&1; then
   echo ""
   echo -e "${BOLD}${CYAN}Herd Services Manager${RESET}"
   echo -e "${DIM}────────────────────────────────────${RESET}"
   echo ""
-  echo -e "${RED}Error:${RESET} Herd services registry not found."
-  echo -e "${DIM}Expected: ${BOLD}$HERD_PLIST${RESET}"
-  echo -e "${DIM}Service management requires a Herd Pro subscription.${RESET}"
+  echo -e "${RED}Error:${RESET} ${BOLD}herd${RESET} CLI not found in PATH."
   echo ""
   exit 1
 fi
@@ -96,6 +94,20 @@ parse_herd_services() {
       port = p
     }
     END { if (svc != "" && ver != "" && port != "") print svc "|" ver "|" port }
+  ' "$HERD_YML"
+}
+
+# Parse the top-level "php" key from herd.yml (e.g. php: '8.5')
+parse_herd_php_version() {
+  awk '
+    /^php:/ {
+      v = $0
+      sub(/^php:[ ]*/, "", v)
+      gsub(/[\x27"\r]/, "", v)
+      gsub(/[ \t]+$/, "", v)
+      print v
+      exit
+    }
   ' "$HERD_YML"
 }
 
@@ -129,81 +141,71 @@ build_herd_ports() {
   done < <(parse_herd_services)
 }
 
-# Look up a service UUID from the Herd plist by type, version, and port
-get_service_id() {
-  awk -v find_type="$1" -v find_version="$2" -v find_port="$3" '
-    /<dict>/              { id=""; cur_type=""; cur_version=""; cur_port=""; next_key="" }
-    /<key>id<\/key>/      { next_key="id" }
-    /<key>type<\/key>/    { next_key="type" }
-    /<key>version<\/key>/ { next_key="version" }
-    /<key>port<\/key>/    { next_key="port" }
-    next_key != "" && /<string>/ {
-      val=$0; gsub(/[ \t]*<string>/, "", val); gsub(/<\/string>.*/, "", val)
-      if      (next_key == "id")      id=val
-      else if (next_key == "type")    cur_type=val
-      else if (next_key == "version") cur_version=val
-      else if (next_key == "port")    cur_port=val
-      next_key=""
-    }
-    /<\/dict>/ {
-      if (cur_type == find_type && cur_version == find_version && cur_port == find_port && id != "") {
-        print id; exit
-      }
-    }
-  ' "$HERD_PLIST"
-}
-
-# Extract active services from MCP JSON (output: type|port|version per line)
-# Uses awk with quote-delimited fields to scan for known key patterns.
-# Parent service "type" values are lowercase (redis, minio), while installed
-# service "type" values are capitalized (Redis, MinIO), so we distinguish them.
-extract_active_services() {
-  echo "$1" | awk -F'"' '{
-    parent_type = ""
-    in_installed = 0
-    is_port = ""; is_version = ""; is_active = 0
-
-    for (i = 1; i <= NF; i++) {
-      if ($i == "label" && $(i+1) ~ /^:/) in_installed = 0
-
-      if ($i == "installedServices") {
-        in_installed = 1
-        is_port = ""; is_version = ""; is_active = 0
-      }
-
-      if ($i == "type" && $(i+1) ~ /^:/) {
-        val = $(i+2)
-        if (val ~ /^[a-z]/) {
-          if (is_active && parent_type != "" && is_port != "" && is_version != "") {
-            print parent_type "|" is_port "|" is_version
-          }
-          parent_type = val
-          in_installed = 0
-          is_port = ""; is_version = ""; is_active = 0
+# Parse the JSON array from `herd services:list --json` into pipe-delimited rows.
+# Output format per service: type|port|version|status|id
+#
+# We use FS='"' so each quoted JSON string becomes its own field. The keys and
+# values alternate (key, value, key, value...) and a "},{" or "}]" in the
+# separator between fields marks an object boundary. This avoids needing jq
+# while still being safe against any field ordering Herd produces.
+#
+# Skips any non-JSON lines (e.g. PHP warnings printed before the JSON).
+parse_herd_services_json() {
+  awk -F'"' '
+    /^\[/ {
+      type=""; port=""; version=""; status=""; id=""
+      pos=0; current_key=""
+      for (i = 2; i <= NF; i += 2) {
+        if ($(i-1) ~ /\}/) {
+          if (type != "") print type "|" port "|" version "|" status "|" id
+          type=""; port=""; version=""; status=""; id=""
+          pos=0; current_key=""
+        }
+        if (pos == 0) {
+          current_key = $i
+          pos = 1
+        } else {
+          if      (current_key == "type")    type = $i
+          else if (current_key == "port")    port = $i
+          else if (current_key == "version") version = $i
+          else if (current_key == "status")  status = $i
+          else if (current_key == "id")      id = $i
+          pos = 0
         }
       }
-
-      if (in_installed) {
-        if ($i == "status" && $(i+1) ~ /^:/ && $(i+2) == "active") is_active = 1
-        if ($i == "port" && $(i+1) ~ /^:/) is_port = $(i+2)
-        if ($i == "version" && $(i+1) ~ /^:/) is_version = $(i+2)
-      }
+      if (type != "") print type "|" port "|" version "|" status "|" id
     }
+  '
+}
 
-    if (is_active && parent_type != "" && is_port != "" && is_version != "") {
-      print parent_type "|" is_port "|" is_version
-    }
-  }'
+# Look up a service UUID from the cached Herd services data by type/version/port
+get_service_id() {
+  echo "$HERD_SERVICES_DATA" | awk -F'|' -v t="$1" -v v="$2" -v p="$3" '
+    $1 == t && $3 == v && $2 == p { print $5; exit }
+  '
+}
+
+# Extract active (running) services from cached data (output: type|port|version per line)
+extract_active_services() {
+  echo "$HERD_SERVICES_DATA" | awk -F'|' '$4 == "running" { print $1 "|" $2 "|" $3 }'
 }
 
 echo ""
 echo -e "${BOLD}${CYAN}Herd Services Manager${RESET}"
 echo -e "${DIM}────────────────────────────────────${RESET}"
 
-if [[ "$MODE" == "start" && "$CONFLICTS_ONLY" == true ]]; then
-  echo -e "${DIM}Mode: start (conflicts only)${RESET}"
-elif [[ "$MODE" == "start" ]]; then
-  echo -e "${DIM}Mode: start${RESET}"
+if [[ "$MODE" == "start" ]]; then
+  mode_flags=""
+  [[ "$CONFLICTS_ONLY" == true ]] && mode_flags="conflicts only"
+  if [[ "$ISOLATE" == true ]]; then
+    [[ -n "$mode_flags" ]] && mode_flags+=", "
+    mode_flags+="isolated PHP"
+  fi
+  if [[ -n "$mode_flags" ]]; then
+    echo -e "${DIM}Mode: start ($mode_flags)${RESET}"
+  else
+    echo -e "${DIM}Mode: start${RESET}"
+  fi
 elif [[ "$MODE" == "stop" && "$ALL" == true ]]; then
   echo -e "${DIM}Mode: stop all${RESET}"
 else
@@ -212,20 +214,27 @@ fi
 
 echo ""
 
-# --- Fetch current services from Herd MCP ---
+# --- Fetch current services from the herd CLI ---
 echo -e "${BOLD}Fetching current Herd services...${RESET}"
-mcp_raw=$(
-  printf '{"jsonrpc":"2.0","method":"tools/call","params":{"name":"find_available_services","arguments":{}},"id":1}\n{"jsonrpc":"2.0","method":"exit"}\n' \
-    | "$PHP_BIN" "$HERD_MCP" 2>/dev/null || true
-)
+# Capture stdout AND stderr together. A misconfigured php.ini may make Herd
+# print Zend extension warnings before the JSON (to either stdout or stderr,
+# depending on display_errors). The clean case is just a JSON line on its own.
+# We use `grep -m1 '^\['` to grab the first line that starts with `[`, which
+# works for both cases — with or without preceding warning lines.
+herd_services_raw=$(herd services:list --json 2>&1 || true)
+herd_services_json=$(echo "$herd_services_raw" | grep -m1 '^\[')
 
-# Extract the text field from MCP JSON response and unescape
-services_json=$(echo "$mcp_raw" | head -n 1 | sed 's/.*"text":"//; s/"}],"isError".*//' | sed 's/\\"/"/g; s/\\\//\//g')
-
-if [[ -z "$services_json" ]]; then
-  echo -e "${RED}Error:${RESET} failed to fetch services from Herd MCP" >&2
+if [[ -z "$herd_services_json" ]]; then
+  echo -e "${RED}Error:${RESET} failed to fetch services from ${BOLD}herd services:list --json${RESET}" >&2
+  echo -e "${DIM}Service management requires a Herd Pro subscription.${RESET}" >&2
+  if [[ -n "$herd_services_raw" ]]; then
+    echo -e "${DIM}Output from herd command:${RESET}" >&2
+    echo "$herd_services_raw" | sed 's/^/  /' >&2
+  fi
   exit 1
 fi
+
+HERD_SERVICES_DATA=$(echo "$herd_services_json" | parse_herd_services_json)
 
 # Resolve herd.yml ports
 load_port_env_vars
@@ -257,6 +266,37 @@ kept_services=""
 # MODE: start
 # =============================================================================
 if [[ "$MODE" == "start" ]]; then
+
+  # --- Switch PHP version (if defined in herd.yml) ---
+  php_version=$(parse_herd_php_version)
+  if [[ -n "$php_version" ]]; then
+    echo ""
+    if [[ "$ISOLATE" == true ]]; then
+      echo -e "${BOLD}Isolating PHP version${RESET}"
+    else
+      echo -e "${BOLD}Setting PHP version${RESET}"
+    fi
+    echo -e "${DIM}────────────────────────────────────${RESET}"
+
+    php_label=$(printf "%-15s" "php")
+    if [[ "$ISOLATE" == true ]]; then
+      if herd_err=$(herd isolate "$php_version" 2>&1 >/dev/null); then
+        echo -e "  ${php_label} ${DIM}version:${RESET} $php_version ${GREEN}isolated${RESET} ${DIM}(per-site)${RESET}"
+      else
+        echo -e "  ${php_label} ${DIM}version:${RESET} $php_version ${YELLOW}warning${RESET} ${DIM}(failed to isolate)${RESET}"
+        [[ -n "$herd_err" ]] && echo -e "    ${RED}${DIM}↳ $(echo "$herd_err" | head -n 1)${RESET}"
+        fail_count=$((fail_count + 1))
+      fi
+    else
+      if herd_err=$(herd use "$php_version" 2>&1 >/dev/null); then
+        echo -e "  ${php_label} ${DIM}version:${RESET} $php_version ${GREEN}set${RESET} ${DIM}(global default)${RESET}"
+      else
+        echo -e "  ${php_label} ${DIM}version:${RESET} $php_version ${YELLOW}warning${RESET} ${DIM}(failed to set)${RESET}"
+        [[ -n "$herd_err" ]] && echo -e "    ${RED}${DIM}↳ $(echo "$herd_err" | head -n 1)${RESET}"
+        fail_count=$((fail_count + 1))
+      fi
+    fi
+  fi
 
   # --- Stop active services ---
   echo ""
@@ -290,7 +330,7 @@ if [[ "$MODE" == "start" ]]; then
       fail_count=$((fail_count + 1))
     fi
     stop_count=$((stop_count + 1))
-  done < <(extract_active_services "$services_json")
+  done < <(extract_active_services)
 
   if [[ $stop_count -eq 0 && $kept_count -eq 0 ]]; then
     echo -e "  ${DIM}No active services to stop${RESET}"
@@ -363,7 +403,7 @@ elif [[ "$MODE" == "stop" ]]; then
         fail_count=$((fail_count + 1))
       fi
       stop_count=$((stop_count + 1))
-    done < <(extract_active_services "$services_json")
+    done < <(extract_active_services)
 
     if [[ $stop_count -eq 0 ]]; then
       echo -e "  ${DIM}No active services to stop${RESET}"
